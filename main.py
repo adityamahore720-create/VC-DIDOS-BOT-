@@ -6,55 +6,68 @@ import asyncio
 import logging
 import sys
 
-from pyrogram import Client
-
-from config import Config
-from bot_handler import register
-
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 except ImportError:
     pass
 
+from pyrogram import Client, idle
 
-def setup_logging(log_file: str) -> None:
+from config import Config
+from bot_handler import register
+
+
+def setup_logging() -> None:
     fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     logging.basicConfig(
         level=logging.INFO,
         format=fmt,
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
+        handlers=[logging.StreamHandler(sys.stdout)],
+        force=True,
     )
 
 
 async def main() -> None:
-    cfg = Config.from_env()
-    setup_logging(cfg.log_file)
+    setup_logging()
     log = logging.getLogger("main")
 
+    # ── config ─────────────────────────────────────────────────────────────────
+    try:
+        cfg = Config.from_env()
+    except ValueError as exc:
+        log.critical(f"❌ Config error: {exc}")
+        log.critical("Set API_ID, API_HASH, BOT_TOKEN in Render → Environment tab")
+        sys.exit(1)
+
+    log.info(f"Config OK | threads={cfg.max_threads} | max_dur={cfg.max_duration}s")
+
+    # ── client ─────────────────────────────────────────────────────────────────
     bot = Client(
-        "miss_chutki",
+        name="miss_chutki",
         api_id=cfg.api_id,
         api_hash=cfg.api_hash,
         bot_token=cfg.bot_token,
+        workdir="/tmp",          # writable on Render's ephemeral FS
+        no_updates=False,
     )
 
     register(bot, cfg)
 
-    log.info(f"ᴍɪꜱꜱ ᴄʜᴜᴛᴋɪ starting — max_threads={cfg.max_threads} max_dur={cfg.max_duration}s")
+    # ── start ──────────────────────────────────────────────────────────────────
+    log.info("Starting bot…")
     await bot.start()
-    log.info("Bot online. Polling…")
+    me = await bot.get_me()
+    log.info(f"✅ Online as @{me.username} (id={me.id})")
 
-    try:
-        await asyncio.Event().wait()   # run forever
-    except (KeyboardInterrupt, SystemExit):
-        pass
-    finally:
-        await bot.stop()
-        log.info("Bot stopped.")
+    # ── keep alive ─────────────────────────────────────────────────────────────
+    # pyrogram.idle() blocks until SIGINT/SIGTERM — correct for Render workers
+    await idle()
+
+    # ── shutdown ───────────────────────────────────────────────────────────────
+    log.info("Shutting down…")
+    await bot.stop()
+    log.info("Done.")
 
 
 if __name__ == "__main__":
