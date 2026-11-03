@@ -1,78 +1,44 @@
-# Telegram VC Monitor + Safe Network Diagnostics (Termux)
+# NXC MULTI MANAGER — Vercel
 
-> This project is designed for **defensive monitoring and diagnostics only**. It does **not** support public-target DDoS behavior. UDP/TCP diagnostics are restricted to private/loopback/reserved ranges.
+A Telegram bot to save channel/group targets and custom report-form drafts.
+It does **not** log into Telegram user accounts, collect OTP/passwords, or
+send/coordinate reports. Review and submit any report yourself through
+Telegram's official reporting interface.
 
-## What this rewrite provides
+## 1. Create the bot
+1. Open Telegram and message `@BotFather`.
+2. Run `/newbot` and copy the bot token.
+3. Never share the token publicly.
 
-- Dual-client architecture (Bot + User session)
-- On-demand VC scan (`/scan`) only (no background scraping)
-- Inline group selection and manual approval flow
-- VC join + raw metadata extraction + clean leave
-- Async diagnostics engine (`asyncio` + `run_in_executor`) with buffer pooling
-- Live progress dashboard updates every 5 seconds
-- Global stop and structured logging to `bot.log`
+## 2. Create persistent storage
+1. Create a free Upstash Redis database.
+2. Copy its REST URL and REST token.
 
-## File Layout
+## 3. Deploy to Vercel
+1. Upload this project to a GitHub repository.
+2. Import that repository in Vercel.
+3. Add these Environment Variables in Vercel:
+   - `BOT_TOKEN`
+   - `UPSTASH_REDIS_REST_URL`
+   - `UPSTASH_REDIS_REST_TOKEN`
+4. Deploy and copy your deployment URL, for example:
+   `https://your-project.vercel.app`
 
-- `main.py` — dual-client bootstrap and lifecycle
-- `config.py` — dotenv config loading and validation
-- `vc_detector.py` — raw API voice chat detection and metadata extraction
-- `attack_engine.py` — async diagnostics engine (safe target guardrails)
-- `bot_handler.py` — state machine and Telegram interaction layer
-- `utils.py` — helpers (bytes formatter, resolver, IP safety checks)
+## 4. Set Telegram webhook
+Open this URL in your browser, replacing the values:
 
-## Termux Setup
+`https://api.telegram.org/botYOUR_BOT_TOKEN/setWebhook?url=https://YOUR_PROJECT.vercel.app/api/webhook`
 
-```bash
-pkg update -y && pkg upgrade -y
-pkg install -y python rust clang libffi openssl
-python -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip wheel
-pip install -r requirements.txt
-```
+Telegram should return `{"ok":true,"result":true,...}`.
 
-## .env Example
-
-```env
-API_ID=1234567
-API_HASH=your_api_hash
-BOT_TOKEN=123456:ABC-DEF...
-SESSION_STRING=your_pyrogram_session_string
-ADMIN_ID=123456789  # optional (used only for startup notification target)
-MAX_DURATION=600
-MAX_THREADS=100
-SCAN_LIMIT=50
-```
-
-`ADMIN_ID` is optional and is only used as the startup notification chat target.
-
-## Run
-
-```bash
-python main.py
-```
-
-## Command Flow
-
-1. `/scan` → on-demand scan over top dialogs (configurable via `SCAN_LIMIT`)
-2. Select active VC from inline buttons
-3. Confirm join/extract (`✅ PROCEED` or `❌ CANCEL`)
-4. Metadata extraction executes with raw methods
-5. Optional diagnostics command:
-   - `/diag <ip> <port> <duration>`
-   - only private/loopback/reserved targets are permitted
-6. `Leave VC` inline action performs clean exit
-7. `/stop` triggers global stop for active diagnostic tasks
-
-## Error Handling
-
-- `FloodWait` lockout is surfaced in bot replies with wait seconds
-- `ChatAdminRequired` during join is handled gracefully: metadata extraction still continues for active VC
-- `UserAlreadyParticipant` is handled gracefully
-- All runtime logs are written to `bot.log`
+## Commands
+- `/start` — open menu
+- `/target` — save a channel/group as `Name | ID`
+- `/form` — save a report draft as `Form Name | Report message`
+- `/targets` — show saved targets
+- `/forms` — show saved report drafts
 
 ## Notes
-
-- Keep this tool compliant with local laws and Telegram Terms.
-- Do not run diagnostics against systems you do not own or explicitly control.
+- This is a basic personal bot; it does not provide unlimited Telegram-account login.
+- Do not enter Telegram account passwords or login OTPs into this bot.
+- Saved report forms are drafts for manual review, not automatic reports.
